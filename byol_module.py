@@ -5,6 +5,8 @@ from torch.nn import functional as F
 from torch.optim.lr_scheduler import StepLR
 from torchvision.models import densenet
 
+from copy import deepcopy
+
 import pl_bolts
 from pl_bolts import metrics
 from pl_bolts.datamodules import CIFAR10DataModule, STL10DataModule, ImagenetDataModule
@@ -129,8 +131,10 @@ class BYOL(pl.LightningModule):
         self.datamodule = datamodule
 
         self.loss_func = self.init_loss()
-        self.encoder = self.init_encoder()
+        self.encoder = DensenetEncoder()
+        self.target_encoder = deepcopy(self.encoder)
         self.projection = self.init_projection()
+        self.prediction = self.init_prediction()
 
         if self.online_evaluator:
             z_dim = self.projection.output_dim
@@ -151,16 +155,15 @@ class BYOL(pl.LightningModule):
     def init_projection(self):
         return Projection()
 
+    def init_prediction(self):
+        return Prediction()
+
     def forward(self, x):
-        h = self.encoder(x)
-        z = self.projection(h)
-        return h, z
+        representation = self.encoder(x)
+        #z = self.projection(h)
+        return representation
 
     def training_step(self, batch, batch_idx):
-        if isinstance(self.datamodule, STL10DataModule):
-            labeled_batch = batch[1]
-            unlabeled_batch = batch[0]
-            batch = unlabeled_batch
 
         (img_1, img_2), y = batch
         h1, z1 = self.forward(img_1)
