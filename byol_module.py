@@ -4,6 +4,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.optim.lr_scheduler import StepLR
 from torchvision.models import densenet
+import math
 
 from copy import deepcopy
 
@@ -15,6 +16,7 @@ from pl_bolts.metrics import mean
 from pl_bolts.models.self_supervised.evaluator import SSLEvaluator
 from pl_bolts.models.self_supervised.simclr.simclr_transforms import SimCLREvalDataTransform, SimCLRTrainDataTransform
 from pl_bolts.optimizers.layer_adaptive_scaling import LARS
+from pl_bolts.utils.self_supervised import torchvision_ssl_encoder
 
 
 class DensenetEncoder(nn.Module):
@@ -30,37 +32,42 @@ class DensenetEncoder(nn.Module):
         return out
 
 
-class Projection(nn.Module):
-    def __init__(self, input_dim=4096, output_dim=256):
+class MLP(nn.Module):
+    def __init__(self, input_dim=2048, hidden_size=4096, output_dim=256):
         super().__init__()
         self.output_dim = output_dim
         self.input_dim = input_dim
         self.model = nn.Sequential(
-            nn.Linear(input_dim, 512, bias=False),
-            nn.BatchNorm1d(512),
+            nn.Linear(input_dim, hidden_size, bias=False),
+            nn.BatchNorm1d(hidden_size),
             nn.ReLU(inplace=True),
-            nn.Linear(512, output_dim, bias=True))
+            nn.Linear(hidden_size, output_dim, bias=True))
 
     def forward(self, x):
         x = self.model(x)
-        # contrary to SimCLR, the output of this MLP is not batch normalized
         return x
 
-class Prediction(nn.Module):
-    # prediction has the same architecture as projection
-    def __init__(self, input_dim=4096, output_dim=256):
+
+class SiameseArm(nn.Module):
+    def __init__(self, encoder=None):
         super().__init__()
-        self.output_dim = output_dim
-        self.input_dim = input_dim
-        self.model = nn.Sequential(
-            nn.Linear(input_dim, 512, bias=False),
-            nn.BatchNorm1d(512),
-            nn.ReLU(inplace=True),
-            nn.Linear(512, output_dim, bias=True))
+
+        if encoder is None:
+            encoder = torchvision_ssl_encoder('resnet50')
+        # Encoder
+        self.encoder = encoder
+        # Projector
+        self.projector = MLP()
+        # Predictor
+        self.predictor = MLP(input_dim=256)
 
     def forward(self, x):
-        x = self.model(x)
-        return x
+        y = self.encoder(x)[0]
+        y = y.view(y.size(0), -1)
+        z = self.projector(y)
+        h = self.predictor(z)
+        return y, z, h
+
 
 class BYOL(pl.LightningModule):
     def __init__(self,
@@ -70,7 +77,6 @@ class BYOL(pl.LightningModule):
                  weight_decay: float = 0.0005,
                  input_height: int = 32,
                  batch_size: int = 1,
-                 online_ft: bool = False,
                  num_workers: int = 4,
                  optimizer: str = 'lars',
                  lr_sched_step: float = 30.0,
@@ -80,23 +86,28 @@ class BYOL(pl.LightningModule):
                  loss_temperature: float = 0.5,
                  **kwargs):
         """
-        PyTorch Lightning implementation of `SIMCLR <https://arxiv.org/abs/2002.05709.>`_
-        Paper authors: Ting Chen, Simon Kornblith, Mohammad Norouzi, Geoffrey Hinton.
+        .. warning:: Work in progress. This implementation is still being verified
+
+        PyTorch Lightning implementation of `BYOL <https://arxiv.org/pdf/2006.07733.pdf.>`_
+        Paper authors: Jean-Bastien Grill ,Florian Strub, Florent Altché, Corentin Tallec, Pierre H. Richemond,
+        Elena Buchatskaya, Carl Doersch, Bernardo Avila Pires, Zhaohan Daniel Guo, Mohammad Gheshlaghi Azar,
+        Bilal Piot, Koray Kavukcuoglu, Rémi Munos, Michal Valko.
+
         Model implemented by:
-            - `William Falcon <https://github.com/williamFalcon>`_
-            - `Tullie Murrell <https://github.com/tullie>`_
+            - `Annika Brundyn <https://github.com/annikabrundyn>`_
+
         Example:
-            >>> from pl_bolts.models.self_supervised import SimCLR
+            >>> from pl_bolts.models.self_supervised import BYOL
             ...
-            >>> model = SimCLR()
+            >>> model = BYOL()
         Train::
             trainer = Trainer()
             trainer.fit(model)
         CLI command::
             # cifar10
-            python simclr_module.py --gpus 1
+            python byol_module.py --gpus 1
             # imagenet
-            python simclr_module.py
+            python byol_module.py
                 --gpus 8
                 --dataset imagenet2012
                 --data_dir /path/to/imagenet/
@@ -109,7 +120,6 @@ class BYOL(pl.LightningModule):
             weight_decay: optimizer weight decay
             input_height: image input height
             batch_size: the batch size
-            online_ft: whether to tune online or not
             num_workers: number of workers
             optimizer: optimizer name
             lr_sched_step: step for learning rate scheduler
@@ -120,7 +130,6 @@ class BYOL(pl.LightningModule):
         """
         super().__init__()
         self.save_hyperparameters()
-        self.online_evaluator = online_ft
 
         # init default datamodule
         if datamodule is None:
@@ -130,129 +139,55 @@ class BYOL(pl.LightningModule):
 
         self.datamodule = datamodule
 
-        self.loss_func = self.init_loss()
-        self.encoder = DensenetEncoder()
-        self.target_encoder = deepcopy(self.encoder)
-        self.projection = self.init_projection()
-        self.prediction = self.init_prediction()
-
-        if self.online_evaluator:
-            z_dim = self.projection.output_dim
-            num_classes = self.datamodule.num_classes
-            self.non_linear_evaluator = SSLEvaluator(
-                n_input=z_dim,
-                n_classes=num_classes,
-                p=0.2,
-                n_hidden=1024
-            )
-
-    def init_loss(self):
-        return nt_xent_loss
-
-    def init_encoder(self):
-        return DensenetEncoder()
-
-    def init_projection(self):
-        return Projection()
-
-    def init_prediction(self):
-        return Prediction()
+        self.online_network = SiameseArm()
+        self.target_network = deepcopy(self.online_network)
 
     def forward(self, x):
-        representation = self.encoder(x)
-        #z = self.projection(h)
-        return representation
+        y, _, _ = self.online_network(x)
+        return y
+
+    def shared_step(self, batch, batch_idx):
+        (img_1, img_2), y = batch
+
+        # Image 1 to image 2 loss
+        y1, z1, h1 = self.online_network(img_1)
+        with torch.no_grad():
+            y2, z2, h2 = self.target_network(img_2)
+        loss_a = F.mse_loss(h1, z2)
+
+        # Image 2 to image 1 loss
+        y1, z1, h1 = self.online_network(img_2)
+        with torch.no_grad():
+            y2, z2, h2 = self.target_network(img_1)
+        loss_b = F.mse_loss(h1, z2)
+
+        # final loss
+        total_loss = loss_a + loss_b
+
+        return loss_a, loss_b, total_loss
 
     def training_step(self, batch, batch_idx):
+        loss_a, loss_b, total_loss = self.shared_step(batch, batch_idx)
 
-        (img_1, img_2), y = batch
-        h1, z1 = self.forward(img_1)
-        h2, z2 = self.forward(img_2)
-
-        # return h1, z1, h2, z2
-        loss = self.loss_func(z1, z2, self.hparams.loss_temperature)
-        log = {'train_ntx_loss': loss}
-
-        # don't use the training signal, just finetune the MLP to see how we're doing downstream
-        if self.online_evaluator:
-            if isinstance(self.datamodule, STL10DataModule):
-                (img_1, img_2), y = labeled_batch
-
-            with torch.no_grad():
-                h1, z1 = self.forward(img_1)
-
-            # just in case... no grads into unsupervised part!
-            z_in = z1.detach()
-
-            z_in = z_in.reshape(z_in.size(0), -1)
-            mlp_preds = self.non_linear_evaluator(z_in)
-            mlp_loss = F.cross_entropy(mlp_preds, y)
-            loss = loss + mlp_loss
-            log['train_mlp_loss'] = mlp_loss
-
-        result = {
-            'loss': loss,
-            'log': log
-        }
+        # log results
+        result = pl.TrainResult(minimize=total_loss)
+        result.log_dict({'1_2_loss': loss_a, '2_1_loss': loss_b, 'train_loss': total_loss})
 
         return result
 
     def validation_step(self, batch, batch_idx):
-        if isinstance(self.datamodule, STL10DataModule):
-            labeled_batch = batch[1]
-            unlabeled_batch = batch[0]
-            batch = unlabeled_batch
+        loss_a, loss_b, total_loss = self.shared_step(batch, batch_idx)
 
-        (img_1, img_2), y = batch
-        h1, z1 = self.forward(img_1)
-        h2, z2 = self.forward(img_2)
-        loss = self.loss_func(z1, z2, self.hparams.loss_temperature)
-        result = {'val_loss': loss}
-
-        if self.online_evaluator:
-            if isinstance(self.datamodule, STL10DataModule):
-                (img_1, img_2), y = labeled_batch
-                h1, z1 = self.forward(img_1)
-
-            z_in = z1.reshape(z1.size(0), -1)
-            mlp_preds = self.non_linear_evaluator(z_in)
-            mlp_loss = F.cross_entropy(mlp_preds, y)
-            acc = metrics.accuracy(mlp_preds, y)
-            result['mlp_acc'] = acc
-            result['mlp_loss'] = mlp_loss
+        # log results
+        result = pl.EvalResult(early_stop_on=total_loss, checkpoint_on=total_loss)
+        result.log_dict({'1_2_loss': loss_a, '2_1_loss': loss_b, 'train_loss': total_loss})
 
         return result
 
-    def validation_epoch_end(self, outputs: list):
-        val_loss = mean(outputs, 'val_loss')
-
-        log = dict(
-            val_loss=val_loss,
-        )
-
-        progress_bar = {}
-        if self.online_evaluator:
-            mlp_acc = mean(outputs, 'mlp_acc')
-            mlp_loss = mean(outputs, 'mlp_loss')
-            log['val_mlp_acc'] = mlp_acc
-            log['val_mlp_loss'] = mlp_loss
-            progress_bar['val_acc'] = mlp_acc
-
-        return dict(val_loss=val_loss, log=log, progress_bar=progress_bar)
-
     def configure_optimizers(self):
-        if self.hparams.optimizer == 'adam':
-            optimizer = torch.optim.Adam(
-                self.parameters(), self.hparams.learning_rate, weight_decay=self.hparams.weight_decay)
-        elif self.hparams.optimizer == 'lars':
-            optimizer = LARS(
-                self.parameters(), lr=self.hparams.learning_rate, momentum=self.hparams.lars_momentum,
-                weight_decay=self.hparams.weight_decay, eta=self.hparams.lars_eta)
-        else:
-            raise ValueError(f'Invalid optimizer: {self.optimizer}')
-        scheduler = StepLR(
-            optimizer, step_size=self.hparams.lr_sched_step, gamma=self.hparams.lr_sched_gamma)
-        return [optimizer], [scheduler]
+        optimizer = LARS(self.parameters(), lr=self.hparams.learning_rate)
+        # TODO: add scheduler
+        return optimizer
 
     @staticmethod
     def add_model_specific_args(parent_parser):
@@ -279,6 +214,73 @@ class BYOL(pl.LightningModule):
         parser.add_argument('--meta_dir', default='.', type=str, help='path to meta.bin for imagenet')
 
         return parser
+
+
+class BYOLMAWeightUpdate(pl.Callback):
+
+    def __init__(self, initial_tau=0.996):
+        """
+        Weight update rule from BYOL.
+        Your model should have a:
+            - self.online_network
+            - self.target_network
+
+        Updates the target_network params using an exponential moving average update rule weighted by tau.
+        BYOL claims this keeps the online_network from collapsing.
+
+        Arg:
+            initial_tau: starting tau. Auto-updates with every training step
+        """
+        self.initial_tau = initial_tau
+        self.current_tau = initial_tau
+
+    def on_batch_end(self, trainer, pl_module):
+        # get networks
+        online_net = pl_module.online_network
+        target_net = pl_module.target_network
+
+        # update weights
+        self.update_weights(online_net, target_net)
+
+        # update tau after
+        self.current_tau = self.update_tau(pl_module)
+
+    def update_tau(self, pl_module):
+        tau = 1 - (1 - self.initial_tau) * (torch.cos(math.pi * pl_module.global_step / trainer.max_steps) + 1) / 2
+        return tau
+
+    def update_weights(self, online_net, target_net):
+        # apply MA weight update
+        for (name, online_p), (_, target_p) in zip(online_net.named_parameters(), target_net.named_parameters()):
+            if 'weight' in name:
+                target_p.data = self.current_tau * target_p.data + (1 - self.current_tau) * online_p.data
+
+
+def test_byol_ma_weight_update_callback():
+    a = nn.Linear(100, 10)
+    b = deepcopy(a)
+    a_original = deepcopy(a)
+    b_original = deepcopy(b)
+
+    # make sure a params and b params are the same
+    assert torch.equal(next(iter(a.parameters()))[0], next(iter(b.parameters()))[0])
+
+    # fake weight update
+    opt = torch.optim.SGD(a.parameters(), lr=0.1)
+    y = a(torch.randn(3, 100))
+    loss = y.sum()
+    loss.backward()
+    opt.step()
+    opt.zero_grad()
+
+    # make sure a did in fact update
+    assert not torch.equal(next(iter(a_original.parameters()))[0], next(iter(a.parameters()))[0])
+
+    # do update via callback
+    cb = BYOLMAWeightUpdate(0.8)
+    cb.update_weights(a, b)
+
+    assert not torch.equal(next(iter(b_original.parameters()))[0], next(iter(b.parameters()))[0])
 
 
 # todo: covert to CLI func and add test
@@ -313,5 +315,5 @@ if __name__ == '__main__':
 
     model = BYOL(**args.__dict__, datamodule=datamodule)
 
-    trainer = pl.Trainer.from_argparse_args(args)
+    trainer = pl.Trainer.from_argparse_args(args, callbacks=[BYOLMAWeightUpdate()])
     trainer.fit(model)
