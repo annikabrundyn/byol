@@ -1,8 +1,9 @@
-# PyTorch Lightning implementation of BYOL 
+# Bootstrap Your Own Latent (BYOL) implementation in PyTorch
 
-Bring Your Own Latent Space `(BYOL) <https://arxiv.org/pdf/2006.07733.pdf.>`
+This is an implementation of the new DeepMind paper [*Bootstrap Your Own Latent: A New Approach to Self-Supervised Learning*](https://arxiv.org/pdf/2006.07733.pdf). If you'd like to use this model it's available in the PyTorch Lightning Bolts library where it has been tested, benchmarked against dataset and documented.
 
-Paper authors: Jean-Bastien Grill ,Florian Strub, Florent Altché, Corentin Tallec, Pierre H. Richemond, \
-Elena Buchatskaya, Carl Doersch, Bernardo Avila Pires, Zhaohan Daniel Guo, Mohammad Gheshlaghi Azar, \
-Bilal Piot, Koray Kavukcuoglu, Rémi Munos, Michal Valko.
+Read the BYOL documentation [here](https://pytorch-lightning-bolts.readthedocs.io/en/latest/self_supervised_models.html#byol).
 
+Note: this is still a work in progress. The model currently achieves ~60% test accuracy on CIFAR-10. 
+
+![byol.jpg]
