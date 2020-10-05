@@ -6,4 +6,4 @@ Read the BYOL documentation [here](https://pytorch-lightning-bolts.readthedocs.i
 
 Note: this is still a work in progress. The model currently achieves ~60% test accuracy on CIFAR-10. 
 
-![byol.jpg]
+![](byol.jpg)
